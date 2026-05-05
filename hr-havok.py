@@ -109,7 +109,7 @@ def get_ind_burst_hr(x, height=0.0, min_distance=100):
 # In[3]:
 
 
-# Generate Lorenz system data.
+# Generate Hindmarsh-Rose system data.
 dt = 0.01  # time step
 m = 100000  # number of data samples
 t = np.arange(m) * dt
@@ -120,7 +120,7 @@ x = X[0]
 fig = plt.figure(figsize=(14, 3))
 ax = fig.add_subplot(121, projection="3d")
 ax.plot(X[0], X[1], X[2])
-ax.set_title("Lorenz System")
+ax.set_title("Hindmarsh-Rose System")
 ax.set_xlabel("x")
 ax.set_ylabel("y")
 ax.set_zlabel("z")
@@ -222,7 +222,7 @@ plt.show()
 # Build a longer data set and fit a HAVOK model to it.
 t_long = np.arange(2 * m) * dt
 x_long = generate_hr_data(t_long)[0]
-havok_long = HAVOK(svd_rank=11, delays=200).fit(x_long, t_long)
+havok_long = HAVOK(svd_rank=11, delays=100).fit(x_long, t_long)
 
 # We only use the long HAVOK model to obtain a long forcing signal.
 forcing_long = havok_long.forcing
@@ -343,7 +343,7 @@ for i, delays in enumerate(delay_values):
     # Plot the HAVOK operator:
     ax = fig.add_subplot(2, 4, i + 1)
     vmax = np.abs(havok.operator).max()
-    ax.set_title(f"$q \Delta t = {delays * dt}$")
+    ax.set_title(rf"$q \Delta t = {delays * dt}$")
     ax.imshow(havok.operator.real, vmax=vmax, vmin=-vmax, cmap="PuOr")
     # Plot the HAVOK reconstruction:
     ax = fig.add_subplot(2, 4, i + 5, projection="3d")
