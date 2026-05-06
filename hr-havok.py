@@ -1,389 +1,454 @@
-#!/usr/bin/env python
-# coding: utf-8
+"""
+HAVOK analysis on the Hindmarsh-Rose neuron model.
+Evaluates how well the HAVOK forcing term predicts chaotic bursting.
 
-# # PyDMD
-#
-# ## Tutorial 19: Hankel Alternative View of Koopman (HAVOK)
-
-# In this tutorial, we demonstrate a basic use case of the Hankel Alternative View of Koopman (HAVOK) approach [1] for modeling chaotic systems with partial measurements. In this tutorial, we specifically apply HAVOK to the chaotic Lorenz system, and in the process, we showcase all basic features and parameters of the `HAVOK` module.
-#
-# We begin with some basic imports, including `numpy` for computations, `matplotlib` for plotting, `solve_ivp` for data simulation, and of course, the `HAVOK` module of the PyDMD package for HAVOK applications.
-
-# In[1]:
-
+Parameters from:
+    Dynamical phases of the Hindmarsh-Rose neuronal model (Innocenti et al. 2007)
+    r=0.0021, I_ext=3.281 produces chaotic bursting with positive Lyapunov exponent.
+"""
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
+from scipy.signal import find_peaks
 from pydmd import HAVOK
 
 
-# ### The Chaotic Lorenz System
-#
-# Throughout this tutorial, we examine the Lorenz system
-#
-# $$
-# \begin{cases}
-# \dot{x} = \sigma (y-x) \\
-# \dot{y} = x(\rho-z)-y \\
-# \dot{z} = xy - \beta z
-# \end{cases}
-# $$
-#
-# for the parameters $\sigma, \rho, \beta = 10, 28, 8/3$ and the initial condition $(x_0, y_0, z_0) = (-8,8,27)$. Below we provide code that uses `scipy.integrate.solve_ivp` to propagate this system forward in time. We additionally provide code that uses $x$ data from the Lorenz system in order to detect lobe switching events.
-
-# In[2]:
-
-
-def generate_hr_data(t_eval):
+def hindmarsh_rose(
+    t,
+    state,
+    a = 1.0,
+    b = 3.0,
+    c = 1.0,
+    d = 5.0,
+    r = 0.0021,
+    s = 4.0,
+    x_rest = -1.6,
+    I_ext = 3.281,
+):
     """
-    Generates Hindmarsh-Rose neuron model data.
-    Parameters chosen for chaotic bursting regime.
-    Returns full state (x, y, z) as rows.
+    Hindmarsh-Rose neuron model:
+        dx/dt = y - a*x^3 + b*x^2 - z + I_ext
+        dy/dt = c - d*x^2 - y
+        dz/dt = r * (s*(x - x_rest) - z)
+
+    Default parameters produce chaotic bursting.
     """
+    x, y, z = state
+    dx = y - a * x**3 + b * x**2 - z + I_ext
+    dy = c - d * x**2 - y
+    dz = r * (s * (x - x_rest) - z)
+    return [dx, dy, dz]
 
-    def hr_system(t, state):
-        # Standard Hindmarsh-Rose parameters for chaotic bursting
-        a = 1.0
-        b = 3.0
-        c = 1.0
-        d = 5.0
-        r = 0.006      # slow adaptation rate - key parameter
-        s = 4.0
-        x0 = -1.6
-        I = 3.25       # external current - controls bursting regime
 
-        x, y, z = state
-        x_dot = y - a*x**3 + b*x**2 - z + I
-        y_dot = c - d*x**2 - y
-        z_dot = r * (s*(x - x0) - z)
-        return [x_dot, y_dot, z_dot]
-
-    # Set integrator keywords to replicate the odeint defaults
-    integrator_keywords = {}
-    integrator_keywords["rtol"] = 1e-12
-    integrator_keywords["atol"] = 1e-12
-    integrator_keywords["method"] = "LSODA"
-
+def generate_hr_data(
+    t_eval,
+    **kwargs
+):
+    """Integrate the Hindmarsh-Rose system and return the state matrix."""
     sol = solve_ivp(
-        hr_system,
+        lambda t, s: hindmarsh_rose(t, s, **kwargs),
         [t_eval[0], t_eval[-1]],
-        [-1.6, -10.0, 0.5],
-        t_eval=t_eval,
-        **integrator_keywords,
+        y0 = [0.0, 0.0, 0.0],
+        t_eval = t_eval,
+        method = "RK45",
+        rtol = 1e-10,
+        atol = 1e-12,
     )
-
+    if not sol.success:
+        raise RuntimeError(f"ODE integration failed: {sol.message}")
     return sol.y
 
 
-def get_ind_burst_hr(x, height=0.0, min_distance=100):
+def get_burst_indices(
+    x,
+    dt,
+    height=0.0,
+    min_spike_gap = 5.0,
+    min_burst_gap = 50.0
+):
     """
-    Detect burst onset events in Hindmarsh-Rose x data.
-    A burst begins when x rises sharply above a threshold.
-    
-    height: threshold above which we consider a spike occurring
-    min_distance: minimum samples between detected bursts
+    Detect burst onset indices.
+
+    1. Find all individual spike peaks above `height`
+    2. Group spikes into bursts by inter-spike gap
+    3. For each burst, walk backward from the first spike to find
+       when x first crossed `height` upward — the true burst start
+
+    Args:
+        x (np.ndarray): Membrane potential time series.
+        dt (float): Time step.
+        height (float): Threshold above which x is considered active.
+        min_spike_gap (float): Minimum time between spikes (time units).
+        min_burst_gap (float): Inter-spike gap that signals a new burst (time units).
+
+    Returns:
+        np.ndarray: Indices of burst onsets (true start, not spike peak).
     """
-    from scipy.signal import find_peaks
-    
-    # Find peaks in x — each burst contains multiple spikes
-    # We detect burst ONSETS by finding where x first crosses threshold
-    # going upward after a silent period
-    above = (x > height).astype(int)
-    # Rising edges = silent -> active transitions = burst onsets
-    onsets = np.where(np.diff(above) == 1)[0]
-    
-    # Filter to keep only onsets separated by min_distance
+    spike_idx, _ = find_peaks(x, height=height, distance=int(min_spike_gap / dt))
+
+    if len(spike_idx) == 0:
+        return np.array([], dtype=int)
+
+    # Group spikes into bursts
+    gap_samples = int(min_burst_gap / dt)
+    first_spikes = [spike_idx[0]]
+    for i in range(1, len(spike_idx)):
+        if spike_idx[i] - spike_idx[i - 1] > gap_samples:
+            first_spikes.append(spike_idx[i])
+
+    # Walk backward from each first spike to find true burst start
+    burst_onsets = []
+    for spike in first_spikes:
+        search_start = max(0, spike - int(50 / dt))
+        segment = x[search_start:spike]
+        above_seg = (segment > height).astype(int)
+        crossings_seg = np.where(np.diff(above_seg) == 1)[0]
+        if len(crossings_seg) > 0:
+            burst_onsets.append(search_start + crossings_seg[-1])
+        else:
+            burst_onsets.append(spike)  # fallback to spike peak
+
+    return np.array(burst_onsets)
+
+
+def get_forcing_burst_indices(
+    forcing,
+    dt,
+    threshold,
+    min_burst_gap = 30.0
+):
+    """
+    Find the first threshold crossing of each contiguous active region
+    in the forcing signal.
+
+    Args:
+        forcing (np.ndarray): Forcing time series.
+        dt (float): Time step in seconds.
+        threshold (float): Activation threshold for |forcing|.
+        min_burst_gap (float): Minimum time between active regions (time units).
+
+    Returns:
+        np.ndarray: Indices of predicted burst onsets.
+    """
+    active = np.abs(forcing) > threshold
+    # Find transitions from inactive to active
+    transitions = np.diff(active.astype(int))
+
+    onsets = np.where(transitions == 1)[0] + 1 # rising edges
+    offsets = np.where(transitions == -1)[0] + 1 # falling edges
+
+    if active[0]:
+        onsets = np.insert(onsets, 0, 0)
+    if active[-1]:
+        offsets = np.append(offsets, len(forcing) - 1)
+
     if len(onsets) == 0:
         return onsets
-    filtered = [onsets[0]]
-    for idx in onsets[1:]:
-        if idx - filtered[-1] > min_distance:
-            filtered.append(idx)
-    
-    return np.array(filtered)
+
+    gap_samples = int(min_burst_gap / dt)
+    merged = [onsets[0]]
+    for i in range(1, len(onsets)):
+        gap = onsets[i] - offsets[i - 1]
+        if gap > gap_samples:
+            merged.append(onsets[i])
+
+    return np.array(merged)
 
 
-# We start by simulating Lorenz data for the fine time-step $\Delta t = 0.001$ over $m = 50000$ time points. We then plot the full-state Lorenz system, along with the $x$ coordinate from the Lorenz system. Throughout this tutorial, **we assume that we only have access to $x$ coordinate data. This will be our partial measurement data.**
-
-# In[3]:
-
-
-# Generate Lorenz system data.
-dt = 0.01  # time step
-m = 100000  # number of data samples
-t = np.arange(m) * dt
-X = generate_hr_data(t)
-x = X[0]
-
-# Plot the 3D attractor.
-fig = plt.figure(figsize=(14, 3))
-ax = fig.add_subplot(121, projection="3d")
-ax.plot(X[0], X[1], X[2])
-ax.set_title("Lorenz System")
-ax.set_xlabel("x")
-ax.set_ylabel("y")
-ax.set_zlabel("z")
-# Plot the x time-series.
-ax = fig.add_subplot(122)
-ax.set_title("Input data for HAVOK")
-ax.plot(t, x, c="k")
-ax.set_xlabel("t")
-ax.set_ylabel("x", rotation=0)
-plt.show()
-
-
-# ### Basic HAVOK application
-#
-# In order to apply HAVOK to your data, simply initialize a `HAVOK` model with your desired parameters and invoke the model's `fit` method. Note that input snapshots and time information (either all times of data collection or the time-step $\Delta t$) are both necessary for model fitting.
-
-# In[4]:
-
-
-havok = HAVOK(svd_rank=11, delays=100)
-havok.fit(x, t)
-
-
-# ### Summary plotting
-#
-# Once fitted, the `HAVOK`-specific `plot_summary` function may be used to visualize all major HAVOK results. These results include:
-# - The time-series used to fit the HAVOK model.
-# - The HAVOK regression matrix, which contains the operators $\mathbf{A}$ and $\mathbf{B}$, as well as the "bad fit".
-# - The first time-delay coordinate $v_1$.
-# - The forcing input term $v_r$ and the times the forcing is considered "active".
-# - The attractor recovered via time-delay, plotted with the "active" times.
-# - The attractor that is reconstructed using the fitted HAVOK model.
-#
-# Notice that by applying HAVOK, we are able to (1) recover an attractor that very closely ressembles the true full-state system, (2) obtain a forcing signal that "activates" prior to switching events, and (3) obtain a linear regression model that very accurately models our time-delay coordinates, **all from just using $x$ coordinate data alone!**
-
-# In[5]:
-
-
-havok.plot_summary()
-
-
-# ### Summary plotting customization
-#
-# The `plot_summary` function is also quite customizable. Here are just a handful of ways in which one might customize their plots. See method documentation for more details. Method header is provided for convenience.
-
-# In[6]:
-
-
-"""
-def plot_summary(
-    self,
-    num_plot=None,
-    index_linear=(0, 1, 2),
-    index_forcing=0,
-    forcing_threshold=None,
-    min_jump_dist=None,
-    true_switch_indices=None,
-    figsize=(20, 4),
-    dpi=200,
-    filename=None,
+def compute_recall_vs_window(
+    true_onsets,
+    forcing,
+    dt,
+    threshold,
+    windows = [50.0, 30.0, 20.0, 10.0, 5.0],
+    n_random = 10000
 ):
-"""
+    """
+    For each prediction window size, compute:
+    - HAVOK recall: fraction of bursts with forcing active in window before onset
+    - Baseline recall: same for random windows (empirical chance level)
 
-havok.plot_summary(
-    # Number of data points to plot.
-    num_plot=15000,
-    # Indices of the embeddings to plot (and their order).
-    index_linear=(1, 0),
-    # Threshold at which the forcing is considered large enough to be active.
-    forcing_threshold=0.005,
-    # Indices of true switching events (plotted on the forcing plot as as stars).
-    true_switch_indices=get_ind_burst_hr(x),
-)
+    Args:
+        true_onsets (np.ndarray): Indices of true burst onsets.
+        forcing (np.ndarray): Forcing time series.
+        dt (float): Time step.
+        threshold (float): Activation threshold.
+        windows (list): Prediction window sizes in time units.
+        n_random (int): Number of random windows for baseline.
 
+    Returns:
+        list[dict]: List of dicts with window, recall, baseline.
+    """
+    results = []
+    for window in windows:
+        window_samples = int(window / dt)
 
-# ### Data reconstruction
-#
-# Once fitted, `HAVOK` models can reconstruct the data using just the computed regression matrix and the initial condition on the linear dynamics. Call the `reconstructed_data` attribute to access this.
+        # HAVOK recall
+        TP = FN = 0
+        for i in range(len(true_onsets) - 1):
+            burst_start = true_onsets[i + 1]
+            window_start = burst_start - window_samples
+            f_start = max(0, min(window_start, len(forcing) - 1))
+            f_end = min(burst_start, len(forcing))
+            if np.any(np.abs(forcing[f_start:f_end]) > threshold):
+                TP += 1
+            else:
+                FN += 1
 
-# In[7]:
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
 
+        # Baseline: random windows
+        rand_starts = np.random.randint(0, len(forcing) - window_samples, n_random)
+        baseline = np.mean([
+            np.any(np.abs(forcing[i:i + window_samples]) > threshold)
+            for i in rand_starts
+        ])
 
-plt.figure(figsize=(10, 2))
-plt.plot(t, x, c="k", label="Truth")
-plt.plot(t, havok.reconstructed_data, "--", c="r", label="Reconstruction")
-plt.legend()
-plt.show()
+        results.append(dict(window = window, TP = TP, FN = FN, recall = recall, baseline = baseline))
 
-
-# ### Data prediction
-#
-# And generally speaking, fitted `HAVOK` models can make predictions as long as they are provided with an input forcing signal that goes beyond the training set. Call the `predict` method to execute this process. (Also note that the model must also be provided with the times at which this forcing was evaluated, and an initial condition for the linear portion of the dynamics. See method documentation for more details.)
-#
-# Here, we demonstrate how the `HAVOK` model fitted previously is able to obtain a pretty decent prediction of the data for later times as long as it is given a forcing signal for those later times.
-
-# In[8]:
-
-
-# Build a longer data set and fit a HAVOK model to it.
-t_long = np.arange(2 * m) * dt
-x_long = generate_hr_data(t_long)[0]
-havok_long = HAVOK(svd_rank=11, delays=200).fit(x_long, t_long)
-
-# We only use the long HAVOK model to obtain a long forcing signal.
-forcing_long = havok_long.forcing
-time_long = t_long[: len(forcing_long)]
-
-# Make a prediction using the long forcing signal.
-# Use the HAVOK model fitted to the shorter data set.
-plt.figure(figsize=(14, 2))
-plt.plot(t_long, x_long, c="k", label="Truth")
-plt.plot(
-    t_long,
-    havok.predict(forcing_long, time_long),
-    label="Prediction",
-    c="tab:green",
-)
-plt.legend()
-plt.show()
+    return results
 
 
-# ### Viewing U and $\Sigma$ matrices
-#
-# `HAVOK` models also store SVD information that is obtained after taking the SVD of the Hankel matrix $\mathbf{H}$.
-#
-# $$
-# \mathbf{H} = \mathbf{U} \mathbf{\Sigma} \mathbf{V}^*
-# $$
-#
-# Invoke the `modes` attribute to view the entries of $\mathbf{U}$ and the `singular_vals` attribute to view the entries of $\mathbf{\Sigma}$. Note that the entries of $\mathbf{V}$ are what we are referring to when we talk about the "embeddings". Also note that below, we highlight the 16 leading singular values in order to clarify our consistent usage of `svd_rank=16`.
-
-# In[9]:
-
-
-# Visualize the columns of U.
-plt.figure(figsize=(10, 4))
-plt.subplot(1, 2, 1)
-plt.title("Modes (columns of U)")
-havok = HAVOK(svd_rank=10, delays=100).fit(x, t)
-plt.plot(havok.modes)
-
-# Visualize the entries of Sigma. (Highlight the first 16.)
-plt.subplot(1, 2, 2)
-plt.title("Singular Values of H")
-havok = HAVOK(svd_rank=-1, delays=100).fit(x, t)
-plt.plot(havok.singular_vals, "o", mec="k", ms=8)
-plt.plot(havok.singular_vals[:16], "o", mec="k", ms=8)
-plt.semilogy()
-plt.tight_layout()
-plt.show()
-
-
-# ### Threshold computation
-#
-# Another nifty feature of the `HAVOK` module is that it comes equipped with a threshold computation tool. Simply invoke the `compute_threshold` function of your fitted `HAVOK` instance and it will return a recommended threshold value based on the computed forcing term and the arguments of the function.
-#
-# Here, we demonstrate how one might adjust the parameter `p` of the function in order to adjust the forcing threshold. This parameter can roughly be thought of as the probability that a forcing event will occur. One may also plot the computed threshold against a histogram of the forcing values used and a Gaussian distribution fitted to the histogram if `plot=True`. As always, see method documentation for more details.
-
-# In[10]:
-
-
-"""
-def compute_threshold(
-    self,
-    forcing=0,
-    p=0.01,
-    bins=50,
-    plot=False,
-    plot_kwargs=None,
+def compute_precision_vs_window(
+    true_onsets,
+    pred_onsets,
+    t,
+    dt,
+    windows = [50.0, 30.0, 20.0, 10.0, 5.0],
 ):
-"""
-
-# Re-fit the HAVOK model (because model was overwritten in the last block).
-havok = HAVOK(svd_rank=11, delays=100).fit(x, t)
-
-# Invoke the threshold computer.
-thres = havok.compute_threshold(p=0.09, bins=100, plot=True)
-
-# Invoke plot_summary using the computed threshold value.
-havok.plot_summary(
-    num_plot=30000,
-    forcing_threshold=thres,
-    true_switch_indices=get_ind_burst_hr(x, height=0.0, min_distance=100),
-)
-
-
-# ### Choosing basic parameters
-#
-# In the previous examples, we adjust the `svd_rank` and the `delays` parameters of our HAVOK models, which are arguably the two most significant parameters of the HAVOK algorithm. Basically,
-#
-# - `svd_rank` controls the rank of the fit, i.e. the number of time-delay embeddings we want to keep, and
-# - `delays` controls the number of time-shifted rows to use in our Hankel matrix $\mathbf{H}$.
-#
-# There are also a few things to note when assessing the quality of your HAVOK models:
-#
-# - In the most ideal scenario, your HAVOK operator should be **skew-symmetric and tridiagonal**. This is probably one of the simplest visual cues to use when assessing the quality of your HAVOK models.
-# - Another good visual cue is the quality of your embedded attractor and your reconstructions. Ideally, your **embeddings should be smooth and your reconstructions should be accurate.**
-#
-# With that being said, we now leave users with the following tips and comments:
-#
-# - It is useful to monitor the quantity $q \Delta t$, where $q \equiv $ `delays`. When $q \Delta t$ becomes too large, the HAVOK operator tends to deviate from its ideal structure, and the embedded attractor becomes nonsensical. There is no exact $q \Delta t$ threshold that works for every data set. However, if you find that your HAVOK operators don't turn out to be skew-symmetric and tridiagonal, try *decreasing* `delays` (that or decrease $\Delta t$, however this usually isn't an option).
-#
-# - An `svd_rank` that is too high will often cause HAVOK models to produce poor reconstructions. This is because the embeddings of excessively high-order HAVOK models begin to account for noise and generally useless information. In general, pick a rank after examining the singular value spectrum of your Hankel matrix, that or examine the HAVOK operator and truncate the rank accordingly to maintain a skew-symmetric tridiagonal structure.
-
-# In[11]:
+    """
+    For each prediction window size, compute precision:
+    fraction of predicted onsets followed by a true burst within the window.
+ 
+    Args:
+        true_onsets (np.ndarray): Indices of true burst onsets.
+        pred_onsets (np.ndarray): Indices of predicted burst onsets.
+        t (np.ndarray): Time vector.
+        dt (float): Time step.
+        windows (list): Prediction window sizes in time units.
+ 
+    Returns:
+        list[dict]: List of dicts with window, precision, TP, FP.
+    """
+    results = []
+    for window in windows:
+        window_samples = int(window / dt)
+        TP = FP = 0
+        for p in pred_onsets:
+            future_true = true_onsets[true_onsets >= p]
+            if len(future_true) > 0 and (future_true[0] - p) <= window_samples:
+                TP += 1
+            else:
+                FP += 1
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        results.append(dict(window=window, TP=TP, FP=FP, precision=precision))
+    return results
 
 
-delay_values = [100, 200, 500, 1000]
-rank_values = [15, 16, 17, 18]
+def compute_lead_times(
+    true_onsets,
+    pred_onsets,
+    t,
+    max_lead = None
+):
+    """
+    For each burst, find the last predicted onset before it and compute the lead time.
+    Optionally cap at max_lead to exclude contamination from previous burst activity.
 
-fig = plt.figure(figsize=(12, 6))
-plt.suptitle(
-    "Impact of the delays $q$ on the HAVOK operator and embedded attractor",
-    fontsize=18,
-)
-for i, delays in enumerate(delay_values):
-    # Fit the HAVOK model:
-    havok = HAVOK(svd_rank=11, delays=delays)
+    Args:
+        true_onsets (np.ndarray): Indices of true burst onsets.
+        pred_onsets (np.ndarray): Indices of predicted burst onsets.
+        t (np.ndarray): Time vector.
+        max_lead (float): Maximum valid lead time.
+
+    Returns:
+        np.ndarray: Lead times in time units.
+    """
+    lead_times = []
+    for true_idx in true_onsets:
+        preds_before = pred_onsets[pred_onsets < true_idx]
+        if len(preds_before) > 0:
+            lead = t[true_idx] - t[preds_before[-1]]
+            if max_lead is None or lead <= max_lead:
+                lead_times.append(lead)
+    return np.array(lead_times)
+
+
+def main():
+    # Simulation
+    dt = 0.1
+    m = 500_000
+    t = np.arange(m) * dt
+
+    print("Simulating Hindmarsh-Rose system...")
+    X = generate_hr_data(t)
+
+    # Discard transient
+    transient = int(950 / dt)
+    x = X[0, transient:]
+    t = t[transient:] - t[transient]
+
+    # Ground-truth bursts
+    true_onsets = get_burst_indices(x, dt)
+    ibi = np.diff(t[true_onsets])
+
+    print(f"\n── System characterization ───────────────────────────────────────")
+    print(f"  Total time:          {t[-1]:.1f} time units")
+    print(f"  Bursts detected:     {len(true_onsets)}")
+    print(f"  IBI mean:            {ibi.mean():.1f}")
+    print(f"  IBI std:             {ibi.std():.1f}  (cv = {ibi.std()/ibi.mean():.2f})")
+    print(f"  IBI min:             {ibi.min():.1f}")
+    print(f"  IBI max:             {ibi.max():.1f}")
+
+    # HAVOK
+    print("Fitting HAVOK model...")
+    havok = HAVOK(svd_rank = 15, delays = 100, num_chaos = 1)
     havok.fit(x, t)
-    # Plot the HAVOK operator:
-    ax = fig.add_subplot(2, 4, i + 1)
-    vmax = np.abs(havok.operator).max()
-    ax.set_title(f"$q \Delta t = {delays * dt}$")
-    ax.imshow(havok.operator.real, vmax=vmax, vmin=-vmax, cmap="PuOr")
-    # Plot the HAVOK reconstruction:
-    ax = fig.add_subplot(2, 4, i + 5, projection="3d")
-    ax.plot(
-        havok.linear_dynamics[:, 0],
-        havok.linear_dynamics[:, 1],
-        havok.linear_dynamics[:, 2],
-        c="k",
-    )
-plt.tight_layout()
-plt.show()
 
-fig = plt.figure(figsize=(12, 6))
-plt.suptitle(
-    "Impact of the rank $r$ on the HAVOK operator and reconstructions",
-    fontsize=18,
-)
-for i, svd_rank in enumerate(rank_values):
-    # Fit the HAVOK model:
-    havok = HAVOK(svd_rank=svd_rank, delays=100)
-    havok.fit(x, t)
-    # Plot the HAVOK operator:
-    ax = fig.add_subplot(2, 4, i + 1)
-    vmax = np.abs(havok.operator).max()
-    ax.set_title(f"$r = {svd_rank}$")
-    ax.imshow(havok.operator.real, vmax=vmax, vmin=-vmax, cmap="PuOr")
-    # Plot the HAVOK reconstruction:
-    ax = fig.add_subplot(2, 4, i + 5, projection="3d")
-    ax.plot(
-        havok.reconstructed_embeddings[:, 0],
-        havok.reconstructed_embeddings[:, 1],
-        havok.reconstructed_embeddings[:, 2],
-    )
-plt.tight_layout()
-plt.show()
+    forcing = havok.forcing[:, 0]
+    forcing_time = t[:len(forcing)]
+    threshold = havok.compute_threshold(forcing=0, p=0.2)
+    pred_onsets = get_forcing_burst_indices(forcing, dt, threshold)
+
+    # Forcing statistics
+    q_start = true_onsets[0] + int(50 / dt)
+    q_end   = true_onsets[1] - int(50 / dt)
+    b_start = true_onsets[0] - int(20 / dt)
+    b_end   = true_onsets[0] + int(20 / dt)
+    active_fraction = np.mean(np.abs(forcing) > threshold)
+
+    print(f"\n── HAVOK forcing statistics ──────────────────────────────────────")
+    print(f"  Threshold:                 {threshold:.6f}")
+    print(f"  Forcing std (overall):     {np.std(forcing):.6f}")
+    print(f"  Forcing std (quiescent):   {np.std(forcing[q_start:q_end]):.6f}")
+    print(f"  Forcing std (burst):       {np.std(forcing[b_start:b_end]):.6f}")
+    print(f"  Fraction of time active:   {active_fraction:.3f}")
+    print(f"  Predicted burst onsets:    {len(pred_onsets)}")
+
+    # Lead time
+    # Cap at half the minimum IBI to exclude contamination from previous burst
+    max_lead    = 0.5 * ibi.min()
+    lead_times  = compute_lead_times(true_onsets, pred_onsets, t, max_lead=max_lead)
+ 
+    print(f"\n── Lead time (capped at {max_lead:.1f} tu) ────────────────────────")
+    print(f"  Bursts with valid lead time: {len(lead_times)}/{len(true_onsets)}")
+    print(f"  Mean lead time:              {np.mean(lead_times):.1f} time units")
+    print(f"  Std lead time:               {np.std(lead_times):.1f} time units")
+    print(f"  Lead time as fraction of IBI: {np.mean(lead_times)/ibi.mean():.2f}")
+
+    # Recall and precision vs window
+    windows           = [50.0, 30.0, 20.0, 10.0, 5.0]
+    recall_results    = compute_recall_vs_window(true_onsets, forcing, dt, threshold, windows)
+    precision_results = compute_precision_vs_window(true_onsets, pred_onsets, t, dt, windows)
+ 
+    print(f"\n── Recall vs prediction window ───────────────────────────────────")
+    print(f"  {'Window':>8}  {'Recall':>8}  {'Baseline':>8}  {'Improvement':>12}")
+    for r in recall_results:
+        print(f"  {r['window']:>8.1f}  {r['recall']:>8.3f}  "
+              f"{r['baseline']:>8.3f}  {r['recall']-r['baseline']:>+12.3f}")
+ 
+    print(f"\n── Precision vs prediction window ────────────────────────────────")
+    print(f"  {'Window':>8}  {'Precision':>10}  {'TP':>6}  {'FP':>6}")
+    for r in precision_results:
+        print(f"  {r['window']:>8.1f}  {r['precision']:>10.3f}  "
+              f"{r['TP']:>6}  {r['FP']:>6}")
+
+    # Plots
+    n_plot  = 15_000
+    t_plot  = t[:n_plot]
+    x_plot  = x[:n_plot]
+    f_plot  = forcing[:n_plot]
+
+    in_range      = true_onsets[true_onsets < n_plot]
+    pred_in_range = pred_onsets[pred_onsets < n_plot]
+
+    # (1) Main detection plot
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+    fig.suptitle("HAVOK on Hindmarsh-Rose — Burst Detection", fontsize=14)
+ 
+    ax = axes[0]
+    ax.plot(t_plot, x_plot, c="k", lw=0.6)
+    ax.vlines(t[in_range], x_plot.min(), x_plot.max(),
+              color="tab:blue", lw=1.2, alpha=0.7, label="True burst onset")
+    ax.set_ylabel("x")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("(a) Membrane potential")
+ 
+    ax = axes[1]
+    ax.plot(forcing_time[:n_plot], f_plot, c="gray", lw=0.7)
+    ax.fill_between(forcing_time[:n_plot], f_plot,
+                    where=np.abs(f_plot) > threshold,
+                    color="tab:red", alpha=0.5, label="Active forcing")
+    ax.axhline( threshold, c="tab:red", ls="--", lw=1,
+                label=f"±threshold={threshold:.4f}")
+    ax.axhline(-threshold, c="tab:red", ls="--", lw=1)
+    ax.vlines(t[pred_in_range], f_plot.min(), f_plot.max(),
+              color="tab:orange", lw=1.2, alpha=0.9, label="Predicted burst onset")
+    ax.set_ylabel("Forcing")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("(b) HAVOK forcing term")
+ 
+    ax = axes[2]
+    ax.plot(t_plot, x_plot, c="k", lw=0.5, alpha=0.5)
+    ax.vlines(t[in_range], x_plot.min(), x_plot.max(),
+              color="tab:blue", lw=1.5, alpha=0.7, label="True")
+    ax.vlines(t[pred_in_range], x_plot.min(), x_plot.max(),
+              color="tab:orange", lw=1.5, alpha=0.7, ls="--", label="Predicted")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("x")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("(c) Burst alignment")
+ 
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_burst_detection.png", dpi=150)
+    plt.show()
+ 
+    # (2) Recall and precision vs window
+    recalls    = [r['recall']    for r in recall_results]
+    baselines  = [r['baseline']  for r in recall_results]
+    precisions = [r['precision'] for r in precision_results]
+ 
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+ 
+    ax = axes[0]
+    ax.plot(windows, recalls,   "o-",  c="tab:blue", lw=2, label="HAVOK recall")
+    ax.plot(windows, baselines, "s--", c="gray",     lw=2, label="Baseline (random)")
+    ax.set_xlabel("Prediction window (time units)")
+    ax.set_ylabel("Recall")
+    ax.set_title("Recall vs prediction window")
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+    ax.invert_xaxis()
+ 
+    ax = axes[1]
+    ax.plot(windows, precisions, "o-", c="tab:orange", lw=2, label="HAVOK precision")
+    ax.set_xlabel("Prediction window (time units)")
+    ax.set_ylabel("Precision")
+    ax.set_title("Precision vs prediction window")
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+    ax.invert_xaxis()
+ 
+    plt.suptitle("HAVOK burst prediction accuracy vs window size", fontsize=13)
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_accuracy_vs_window.png", dpi=150)
+    plt.show()
+ 
+    # (3) Lead time histogram
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(lead_times, bins=20, color="tab:blue", edgecolor="k", alpha=0.7)
+    ax.axvline(np.mean(lead_times), c="tab:red", lw=2,
+               label=f"Mean = {np.mean(lead_times):.1f} tu")
+    ax.axvline(0, c="k", lw=1.5, ls="--", label="Burst start")
+    ax.set_xlabel("Lead time (time units)")
+    ax.set_ylabel("Count")
+    ax.set_title("HAVOK forcing lead time before burst onset")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_lead_times.png", dpi=150)
+    plt.show()
 
 
-# ## References:
-#
-# [1] S. L. Brunton, B. W. Brunton, J. L. Proctor, E. Kaiser, and J. N. Kutz, *Chaos
-# as an intermittently forced linear system*, Nature Communications, 8 (2017), pp. 1–9. [https://doi.org/10.1038/s41467-017-00030-8](https://doi.org/10.1038/s41467-017-00030-8)
-
-# In[ ]:
+if __name__ == "__main__":
+    main()
