@@ -5,12 +5,17 @@ Evaluates how well the HAVOK forcing term predicts chaotic bursting.
 Parameters from:
     Dynamical phases of the Hindmarsh-Rose neuronal model (Innocenti et al. 2007)
     r=0.0021, I_ext=3.281 produces chaotic bursting with positive Lyapunov exponent.
+
+Quality metrics from:
+    Colchero et al. (2025) - A multichannel generalization of the HAVOK method
+    R² per component (Eq. 8) and R²_rec reconstruction quality (Eq. 19-20).
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from scipy.integrate import solve_ivp
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, lsim, StateSpace
 from pydmd import HAVOK
 
 
@@ -154,6 +159,184 @@ def get_forcing_burst_indices(
             merged.append(onsets[i])
 
     return np.array(merged)
+
+
+def compute_component_r2(
+    havok,
+):
+    """
+    Compute R^2 for each embedding component's linear regression fit.
+    (Eq. 8 in Colchero et al. 2025)
+
+    Linear components should have R^2 close to 1.
+    Nonlinear (forcing) components should have low R^2.
+
+    Args:
+        havok: fitted HAVOK instance.
+
+    Returns:
+        np.ndarray: R^2 values for each component.
+    """
+    V = havok.delay_embeddings
+    dt = havok.time[1] - havok.time[0]
+    V_dot = np.gradient(V, dt, axis = 0)
+
+    r_squared = []
+    for i in range(V.shape[1]):
+        v_dot_i = V_dot[:, i]
+        coeffs = np.linalg.lstsq(V, v_dot_i, rcond = None)[0]
+        v_dot_pred = V @ coeffs
+        ss_res = np.sum((v_dot_i - v_dot_pred) ** 2)
+        ss_tot = np.sum((v_dot_i - v_dot_i.mean()) ** 2)
+        r_squared.append(1 - ss_res / ss_tot if ss_tot > 0 else 0.0)
+
+    return np.array(r_squared)
+
+
+def project_to_embedding(
+    havok_train,
+    x_data
+):
+    """
+    Project data into the embedding space learned from training data.
+
+    Args:
+        havok_train: HAVOK model fitted on training data.
+        x_data (np.ndarray): Time series to project.
+
+    Returns:
+        tuple: (V_linear, V_forcing) - embeddings split into linear
+            dynamics and forcing components.
+    """
+    H = havok_train.hankel(x_data[np.newaxis, :])
+    U = havok_train._singular_vecs
+    s = havok_train._singular_vals
+    V_data = np.linalg.multi_dot([np.diag(1 / s), U.T, H]).T
+
+    num_chaos = havok_train._num_chaos
+    V_linear = V_data[:, :-num_chaos]
+    V_forcing = V_data[:, -num_chaos:]
+
+    return V_linear, V_forcing
+
+
+def simulate_havok(
+    havok_train,
+    V_linear,
+    V_forcing,
+    t_vec
+):
+    """
+    Simulate the HAVOK linear system using training matrices A and B.
+
+    Args:
+        havok_train: HAVOK model fitted on training data.
+        V_linear (np.ndarray): True linear dynamics.
+        V_forcing (np.ndarray): Forcing terms.
+        t_vec (np.ndarray): Time vector corresponding to the data.
+
+    Returns:
+        np.ndarray: Simulated linear dynamics.
+    """
+    A = havok_train.A
+    B = havok_train.B
+    C = np.eye(len(A))
+    D = 0.0 * B
+    sys = StateSpace(A, B, C, D)
+
+    t_sim = t_vec[:len(V_forcing)] - t_vec[0]
+    V_sim = lsim(sys, U = V_forcing, T = t_sim, X0 = V_linear[0])[1]
+
+    return V_sim
+
+
+def compute_r2_rec(
+    V_true,
+    V_sim
+):
+    """
+    Compute reconstruction quality R^2_rec between true and simulated embeddings.
+    (Eq. 19-20 in Colchero et. al 2025)
+
+    Args:
+        V_true (np.ndarray): True linear dynamics (n, r-1).
+        V_sim (np.ndarray): Simulated linear dynamics (n, r-1).
+
+    Returns:
+        float: Mean R^2_rec across all embedding dimensions.
+    """
+    n = min(len(V_true), len(V_sim))
+    r2_per_dim = []
+    for i in range(V_true.shape[1]):
+        v_og = V_true[:n, i]
+        v_rec = V_sim[:n, i]
+        ss_res = np.sum((v_og - v_rec) ** 2)
+        ss_tot = np.sum((v_og - v_rec.mean()) ** 2)
+        r2_per_dim.append(1 - ss_res / ss_tot if ss_tot > 0 else 0.0)
+    return float(np.mean(r2_per_dim))
+
+
+def compute_r2_rec_vs_length(
+    V_true,
+    V_sim,
+    t_vec,
+    n_points = 20
+):
+    """
+    Compute R^2_rec as a function of simulation length to show
+    how reconstruction quality changes over time.
+
+    Args:
+        V_true (np.ndarray): True embeddings.
+        V_sim (np.ndarray): Simulated embeddings.
+        t_vec (np.ndarray): Time vector.
+        n_points (int): Number of length values to evaluate.
+
+    Returns:
+        tuple: (times, r2_values)
+    """
+    n_max  = min(len(V_true), len(V_sim))
+    fracs  = np.linspace(0.05, 1.0, n_points)
+    times  = []
+    r2s    = []
+    for frac in fracs:
+        n = max(int(frac * n_max), 10)
+        r2 = compute_r2_rec(V_true[:n], V_sim[:n])
+        times.append(t_vec[n - 1] - t_vec[0])
+        r2s.append(r2)
+    return np.array(times), np.array(r2s)
+
+
+def compute_rolling_rmse(
+    V_true,
+    V_sim,
+    t_vec,
+    window_tu = 50.0,
+    dt = 0.1
+):
+    """
+    Compute rolling RMSE between true and simulated embeddings.
+
+    Args:
+        V_true (np.ndarray): True embeddings.
+        V_sim (np.ndarray): Simulated embeddings.
+        t_vec (np.ndarray): Time vector.
+        window_tu (float): Rolling window size in time units.
+        dt (float): Time step.
+
+    Returns:
+        tuple: (times, rmse_values)
+    """
+    window = int(window_tu / dt)
+    n = min(len(V_true), len(V_sim))
+    times, rmse_values = [], []
+    for i in range(0, n - window, window // 2):
+        chunk_true = V_true[i:i + window]
+        chunk_sim = V_sim[i:i + window]
+        rmse = np.sqrt(np.mean((chunk_true - chunk_sim) ** 2))
+        times.append(t_vec[i] - t_vec[0])
+        rmse_values.append(rmse)
+    return np.array(times), np.array(rmse_values)
 
 
 def compute_recall_vs_window(
@@ -301,7 +484,7 @@ def main():
     print(f"  IBI min:             {ibi.min():.1f}")
     print(f"  IBI max:             {ibi.max():.1f}")
 
-    # HAVOK
+    # HAVOK fit on full data (for burst prediction)
     print("Fitting HAVOK model...")
     havok = HAVOK(svd_rank = 15, delays = 100, num_chaos = 1)
     havok.fit(x, t)
@@ -310,6 +493,55 @@ def main():
     forcing_time = t[:len(forcing)]
     threshold = havok.compute_threshold(forcing=0, p=0.2)
     pred_onsets = get_forcing_burst_indices(forcing, dt, threshold)
+
+    # mHAVOK quality metrics
+    r2_components = compute_component_r2(havok)
+
+    print(f"\n── HAVOK model quality ──────────────────────────────────────────")
+    print(f"  R^2 per component:")
+    for i, r2 in enumerate(r2_components):
+        tag = " ← forcing (nonlinear)" if i == len(r2_components) - 1 else ""
+        print(f"    v{i+1:02d}: {r2:.4f}{tag}")
+
+    # 70/30 train/test split for reconstruction quality
+    print("\nFitting HAVOK model (70/30 train/test split)...")
+    split = int(0.7 * len(x))
+    x_train = x[:split]
+    t_train = t[:split]
+    x_test = x[split:]
+    t_test = t[split:]
+ 
+    havok_train = HAVOK(svd_rank=15, delays=100, num_chaos=1)
+    havok_train.fit(x_train, t_train)
+
+    # Project and simulate on training data
+    V_linear_train, V_forcing_train = project_to_embedding(havok_train, x_train)
+    V_sim_train = simulate_havok(
+        havok_train, V_linear_train, V_forcing_train, t_train
+    )
+    r2_rec_train = compute_r2_rec(V_linear_train, V_sim_train)
+    sim_times_train, r2_vs_length_train = compute_r2_rec_vs_length(
+        V_linear_train, V_sim_train, t_train
+    )
+    rmse_times_train, rmse_values_train = compute_rolling_rmse(
+        V_linear_train, V_sim_train, t_train, window_tu=50.0, dt=dt
+    )
+ 
+    # Project and simulate on test data
+    V_linear_test, V_forcing_test = project_to_embedding(havok_train, x_test)
+    V_sim_test = simulate_havok(
+        havok_train, V_linear_test, V_forcing_test, t_test
+    )
+    r2_rec_test = compute_r2_rec(V_linear_test, V_sim_test)
+    sim_times_test, r2_vs_length_test = compute_r2_rec_vs_length(
+        V_linear_test, V_sim_test, t_test
+    )
+    rmse_times_test, rmse_values_test = compute_rolling_rmse(
+        V_linear_test, V_sim_test, t_test, window_tu=50.0, dt=dt
+    )
+ 
+    print(f"  R²_rec on train set: {r2_rec_train:.4f}")
+    print(f"  R²_rec on test set:  {r2_rec_test:.4f}")
 
     # Forcing statistics
     q_start = true_onsets[0] + int(50 / dt)
@@ -447,6 +679,118 @@ def main():
     ax.legend()
     plt.tight_layout()
     plt.savefig("plots/havok_hr_lead_times.png", dpi=150)
+    plt.show()
+
+    # (4) R^2 per component (mHAVOK quality metric)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    colors = ["tab:red" if i == len(r2_components) - 1 else "tab:green"
+              for i in range(len(r2_components))]
+    ax.bar(range(1, len(r2_components) + 1), r2_components,
+           color=colors, edgecolor="k", alpha=0.8)
+    ax.axhline(0.95, c="k", ls="--", lw=1.5, label="τ = 0.95 (linear threshold)")
+    ax.set_xlabel("Component index")
+    ax.set_ylabel("R²")
+    ax.set_title(f"R² per embedding component")
+    ax.set_xticks(range(1, len(r2_components) + 1))
+    ax.set_ylim(0, 1.05)
+ 
+    # Add legend patches
+    ax.legend(handles=[
+        Patch(color="tab:green", label="Linear component"),
+        Patch(color="tab:red",   label="Nonlinear / forcing component"),
+        plt.Line2D([0], [0], c="k", ls="--", lw=1.5, label="τ = 0.95"),
+    ])
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_r2_components.png", dpi=150)
+    plt.show()
+
+    # (5) Embedding reconstruction — train vs test side by side
+    n_show    = int(500 / dt)
+    n_show_tr = min(n_show, len(V_sim_train), len(V_linear_train))
+    n_show_te = min(n_show, len(V_sim_test),  len(V_linear_test))
+ 
+    fig, axes = plt.subplots(3, 2, figsize=(14, 7), sharex="col")
+    fig.suptitle("HAVOK embedding reconstruction — train vs test (first 500 tu)",
+                 fontsize=13)
+ 
+    for i in range(3):
+        # Train
+        t_tr = t_train[:n_show_tr] - t_train[0]
+        axes[i, 0].plot(t_tr, V_linear_train[:n_show_tr, i],
+                        c="k", lw=0.8, label="True")
+        axes[i, 0].plot(t_tr, V_sim_train[:n_show_tr, i],
+                        c="gray", lw=0.8, ls="--", label="Reconstructed")
+        axes[i, 0].set_ylabel(f"v{i+1}")
+        axes[i, 0].set_yticks([])
+ 
+        # Test
+        t_te = t_test[:n_show_te] - t_test[0]
+        axes[i, 1].plot(t_te, V_linear_test[:n_show_te, i],
+                        c="k", lw=0.8, label="True")
+        axes[i, 1].plot(t_te, V_sim_test[:n_show_te, i],
+                        c="tab:red", lw=0.8, ls="--", label="Reconstructed")
+        axes[i, 1].set_yticks([])
+ 
+    axes[0, 0].set_title("Train set")
+    axes[0, 1].set_title("Test set")
+    axes[0, 0].legend(loc="upper right", fontsize=8)
+    axes[0, 1].legend(loc="upper right", fontsize=8)
+    axes[-1, 0].set_xlabel("Time (time units)")
+    axes[-1, 1].set_xlabel("Time (time units)")
+ 
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_reconstruction.png", dpi=150)
+    plt.show()
+ 
+    # (6) R²_rec vs simulation length — train and test
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+ 
+    ax = axes[0]
+    ax.plot(sim_times_train, r2_vs_length_train, "o-", c="gray",
+            lw=2, alpha=0.8, label=f"Train  (R²_rec = {r2_rec_train:.1f})")
+    ax.plot(sim_times_test,  r2_vs_length_test,  "o-", c="tab:blue",
+            lw=2, label=f"Test   (R²_rec = {r2_rec_test:.1f})")
+    ax.axhline(0, c="k", ls="--", lw=1, label="Baseline (predict mean)")
+    ax.set_xlabel("Simulation length (time units)")
+    ax.set_ylabel("R²_rec")
+    ax.set_title("Reconstruction quality vs simulation length")
+    ax.legend(fontsize=8)
+ 
+    ax = axes[1]
+    ax.plot(rmse_times_train, rmse_values_train,
+            c="gray", lw=1.5, alpha=0.8, label="Train")
+    ax.plot(rmse_times_test,  rmse_values_test,
+            c="tab:blue", lw=1.5, label="Test")
+    ax.set_xlabel("Time (time units)")
+    ax.set_ylabel("RMSE (embedding space)")
+    ax.set_title("Rolling RMSE of embedding reconstruction")
+    ax.legend(fontsize=8)
+ 
+    plt.suptitle("HAVOK reconstruction quality — train vs test", fontsize=13)
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_reconstruction_quality.png", dpi=150)
+    plt.show()
+ 
+    # (7) 3D attractor — true vs reconstructed
+    fig = plt.figure(figsize=(12, 5))
+ 
+    ax1 = fig.add_subplot(121, projection="3d")
+    ax1.plot(V_linear_test[:, 0], V_linear_test[:, 1], V_linear_test[:, 2],
+             c="k", lw=0.3, alpha=0.5)
+    ax1.set_title("True embedded attractor (test set)")
+    ax1.set_xlabel("v1"); ax1.set_ylabel("v2"); ax1.set_zlabel("v3")
+    ax1.set_xticks([]); ax1.set_yticks([]); ax1.set_zticks([])
+ 
+    ax2 = fig.add_subplot(122, projection="3d")
+    ax2.plot(V_sim_test[:, 0], V_sim_test[:, 1], V_sim_test[:, 2],
+             c="tab:red", lw=0.3, alpha=0.5)
+    ax2.set_title("Reconstructed attractor (HAVOK simulation)")
+    ax2.set_xlabel("v1"); ax2.set_ylabel("v2"); ax2.set_zlabel("v3")
+    ax2.set_xticks([]); ax2.set_yticks([]); ax2.set_zticks([])
+ 
+    plt.suptitle("Embedded attractor — true vs HAVOK reconstruction", fontsize=13)
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_attractor.png", dpi=150)
     plt.show()
 
 
