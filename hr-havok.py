@@ -543,6 +543,11 @@ def main():
     print(f"  R²_rec on train set: {r2_rec_train:.4f}")
     print(f"  R²_rec on test set:  {r2_rec_test:.4f}")
 
+    print(f"V_linear_test range: {V_linear_test.min():.4f} to {V_linear_test.max():.4f}")
+    print(f"V_sim_test range:    {V_sim_test.min():.4f} to {V_sim_test.max():.4f}")
+    print(f"V_linear_test shape: {V_linear_test.shape}")
+    print(f"V_sim_test shape:    {V_sim_test.shape}")
+
     # Forcing statistics
     q_start = true_onsets[0] + int(50 / dt)
     q_end   = true_onsets[1] - int(50 / dt)
@@ -779,14 +784,12 @@ def main():
              c="k", lw=0.3, alpha=0.5)
     ax1.set_title("True embedded attractor (test set)")
     ax1.set_xlabel("v1"); ax1.set_ylabel("v2"); ax1.set_zlabel("v3")
-    ax1.set_xticks([]); ax1.set_yticks([]); ax1.set_zticks([])
  
     ax2 = fig.add_subplot(122, projection="3d")
     ax2.plot(V_sim_test[:, 0], V_sim_test[:, 1], V_sim_test[:, 2],
              c="tab:red", lw=0.3, alpha=0.5)
     ax2.set_title("Reconstructed attractor (HAVOK simulation)")
     ax2.set_xlabel("v1"); ax2.set_ylabel("v2"); ax2.set_zlabel("v3")
-    ax2.set_xticks([]); ax2.set_yticks([]); ax2.set_zticks([])
  
     plt.suptitle("Embedded attractor — true vs HAVOK reconstruction", fontsize=13)
     plt.tight_layout()
