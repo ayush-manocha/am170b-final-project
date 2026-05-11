@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from scipy.integrate import solve_ivp
 from scipy.signal import find_peaks, lsim, StateSpace
+from scipy.stats import genextreme, ks_2samp, genpareto
 from pydmd import HAVOK
 
 
@@ -339,6 +340,204 @@ def compute_rolling_rmse(
     return np.array(times), np.array(rmse_values)
 
 
+def analyze_ibi_distribution(
+    true_onsets,
+    pred_onsets,
+    t,
+    dt
+):
+    """
+    Compute and compare inter-burst interval distributions between
+    true and predicted burst onsets.
+
+    Fits a Generalized Extreme Value (GEV) distribution to both,
+    computes a KS test to measure similarity, and plots the comparison.
+
+    Args:
+        true_onsets (np.ndarray): Indices of true burst onsets.
+        pred_onsets (np.ndarray): Indices of predicted burst onsets.
+        t (np.ndarray): Time vector.
+        dt (float): Time step.
+    """
+    # Compute IBIs in time units
+    ibi_true = np.diff(t[true_onsets])
+    ibi_pred = np.diff(t[pred_onsets])
+
+    # Fit GEV distribution to both
+    shape_true, loc_true, scale_true = genextreme.fit(ibi_true)
+    shape_pred, loc_pred, scale_pred = genextreme.fit(ibi_pred)
+
+    # KS test between true and predicted IBI distributions
+    ks_stat, ks_pval = ks_2samp(ibi_true, ibi_pred)
+
+    print(f"\n── IBI distribution analysis ─────────────────────────────────────")
+    print(f"  True IBI:  n={len(ibi_true)}  mean={ibi_true.mean():.1f}"
+          f"  std={ibi_true.std():.1f}  min={ibi_true.min():.1f}"
+          f"  max={ibi_true.max():.1f}")
+    print(f"  Pred IBI:  n={len(ibi_pred)}  mean={ibi_pred.mean():.1f}"
+          f"  std={ibi_pred.std():.1f}  min={ibi_pred.min():.1f}"
+          f"  max={ibi_pred.max():.1f}")
+    print(f"  GEV fit (true): shape={shape_true:.3f}  loc={loc_true:.3f}"
+          f"  scale={scale_true:.3f}")
+    print(f"  GEV fit (pred): shape={shape_pred:.3f}  loc={loc_pred:.3f}"
+          f"  scale={scale_pred:.3f}")
+    print(f"  KS statistic: {ks_stat:.4f}  p-value: {ks_pval:.4f}")
+    print(f"  {'Distributions are similar (p>0.05)' if ks_pval > 0.05 else 'Distributions differ significantly (p<0.05)'}")
+
+    # Plot
+    x_range = np.linspace(
+        min(ibi_true.min(), ibi_pred.min()),
+        max(ibi_true.max(), ibi_pred.max()),
+        500
+    )
+    pdf_true = genextreme.pdf(x_range, shape_true, loc_true, scale_true)
+    pdf_pred = genextreme.pdf(x_range, shape_pred, loc_pred, scale_pred)
+
+    fig, axes = plt.subplots(1, 2, figsize = (12, 4))
+
+    # (a) Histogram + fitted GEV
+    ax = axes[0]
+    ax.hist(ibi_true, bins=30, density=True, alpha=0.5,
+            color="tab:blue", edgecolor="k", label="True IBI")
+    ax.hist(ibi_pred, bins=30, density=True, alpha=0.5,
+            color="tab:orange", edgecolor="k", label="Predicted IBI")
+    ax.plot(x_range, pdf_true, c="tab:blue",   lw=2, label="GEV fit (true)")
+    ax.plot(x_range, pdf_pred, c="tab:orange", lw=2, ls="--",
+            label="GEV fit (pred)")
+    ax.set_xlabel("Inter-burst interval (time units)")
+    ax.set_ylabel("Density")
+    ax.set_title(f"IBI distribution  |  KS p={ks_pval:.3f}")
+    ax.legend(fontsize=8)
+
+    # (b) Return period plot
+    # Sort IBIs and compute empirical return period
+    ax = axes[1]
+    for ibi, color, label in [
+        (ibi_true, "tab:blue",   "True"),
+        (ibi_pred, "tab:orange", "Predicted"),
+    ]:
+        sorted_ibi = np.sort(ibi)
+        n          = len(sorted_ibi)
+        # Empirical return period = mean IBI / exceedance probability
+        exceedance = 1 - np.arange(1, n + 1) / (n + 1)
+        return_period = 1 / exceedance
+        ax.plot(return_period, sorted_ibi, "o", c=color,
+                ms=3, alpha=0.6, label=f"{label} (empirical)")
+
+        # GEV fitted return period
+        p_range = np.linspace(0.01, 0.99, 200)
+        rp_range = 1 / (1 - p_range)
+        quantiles = genextreme.ppf(p_range, *genextreme.fit(ibi))
+        ax.plot(rp_range, quantiles, c=color, lw=2)
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Return period")
+    ax.set_ylabel("Inter-burst interval (time units)")
+    ax.set_title("Return period of inter-burst intervals")
+    ax.legend(fontsize=8)
+
+    plt.suptitle("IBI distribution — true vs HAVOK predicted", fontsize=13)
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_ibi_distribution.png", dpi=150)
+    plt.show()
+
+
+def analyze_extremes(x_true, x_recon, t, dt, threshold=1.5):
+    """
+    Extreme value analysis of membrane potential x.
+    Compares exceedance statistics between true and reconstructed x.
+    
+    Args:
+        x_true (np.ndarray): True membrane potential.
+        x_recon (np.ndarray): HAVOK reconstructed membrane potential.
+        t (np.ndarray): Time vector.
+        dt (float): Time step.
+        threshold (float): Exceedance threshold.
+    """
+    n = min(len(x_true), len(x_recon))
+    x_true  = x_true[:n]
+    x_recon = x_recon[:n]
+    t_plot  = t[:n]
+
+    # Exceedances above threshold
+    exc_true  = x_true[x_true   > threshold] - threshold
+    exc_recon = x_recon[x_recon > threshold] - threshold
+
+    # Rate of exceedance (events per time unit)
+    rate_true  = len(exc_true)  / (n * dt)
+    rate_recon = len(exc_recon) / (n * dt)
+
+    # Return period in time units = 1 / (rate * exceedance probability)
+    # Fit GPD to exceedances (standard peaks-over-threshold approach)
+    shape_true,  loc_true,  scale_true  = genpareto.fit(exc_true,  floc=0)
+    shape_recon, loc_recon, scale_recon = genpareto.fit(exc_recon, floc=0)
+
+    print(f"\n── Extreme value analysis (threshold = {threshold}) ──────────────")
+    print(f"  True exceedances:  n={len(exc_true)}   rate={rate_true:.4f}/tu")
+    print(f"  Recon exceedances: n={len(exc_recon)}  rate={rate_recon:.4f}/tu")
+    print(f"  GPD fit (true):  shape={shape_true:.3f}  scale={scale_true:.3f}")
+    print(f"  GPD fit (recon): shape={shape_recon:.3f}  scale={scale_recon:.3f}")
+
+    # Return period curves
+    # P(X > x) = (1 - CDF(x - threshold)) * rate
+    # Return period T = 1 / P(X > x)
+    exc_range = np.linspace(0, max(exc_true.max(), exc_recon.max()), 300)
+    
+    def return_period(exc_values, shape, scale, rate):
+        surv = 1 - genpareto.cdf(exc_values, shape, loc=0, scale=scale)
+        return 1 / (surv * rate)
+
+    rp_true  = return_period(exc_range, shape_true,  scale_true,  rate_true)
+    rp_recon = return_period(exc_range, shape_recon, scale_recon, rate_recon)
+
+    # Empirical return periods
+    def empirical_rp(exc, rate):
+        sorted_exc = np.sort(exc)
+        n          = len(sorted_exc)
+        exceedance_prob = (1 - np.arange(1, n+1) / (n+1)) * rate
+        return 1 / exceedance_prob, sorted_exc
+
+    emp_rp_true,  emp_exc_true  = empirical_rp(exc_true,  rate_true)
+    emp_rp_recon, emp_exc_recon = empirical_rp(exc_recon, rate_recon)
+
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # (a) PDF of exceedances
+    ax = axes[0]
+    ax.hist(exc_true  + threshold, bins=30, density=True, alpha=0.5,
+            color="tab:blue",   edgecolor="k", label="True x")
+    ax.hist(exc_recon + threshold, bins=30, density=True, alpha=0.5,
+            color="tab:red",    edgecolor="k", label="Reconstructed x")
+    ax.axvline(threshold, c="k", ls="--", lw=1.5, label=f"Threshold = {threshold}")
+    ax.set_xlabel("x")
+    ax.set_ylabel("Density")
+    ax.set_title("Distribution of extreme x values")
+    ax.legend(fontsize=8)
+
+    # (b) Return period
+    ax = axes[1]
+    ax.plot(emp_rp_true,  emp_exc_true  + threshold, "o",
+            c="tab:blue", ms=3, alpha=0.5, label="True (empirical)")
+    ax.plot(emp_rp_recon, emp_exc_recon + threshold, "o",
+            c="tab:red",  ms=3, alpha=0.5, label="Reconstructed (empirical)")
+    ax.plot(rp_true,  exc_range + threshold,
+            c="tab:blue", lw=2, label="True (GPD fit)")
+    ax.plot(rp_recon, exc_range + threshold,
+            c="tab:red",  lw=2, ls="--", label="Reconstructed (GPD fit)")
+    ax.set_xscale("log")
+    ax.set_xlabel("Return period (time units)")
+    ax.set_ylabel("x")
+    ax.set_title("Return period of extreme membrane potential")
+    ax.legend(fontsize=8)
+
+    plt.suptitle("Extreme value analysis — true vs HAVOK reconstruction",
+                 fontsize=13)
+    plt.tight_layout()
+    plt.savefig("plots/havok_hr_extremes.png", dpi=150)
+    plt.show()
+
+
 def compute_recall_vs_window(
     true_onsets,
     forcing,
@@ -493,6 +692,12 @@ def main():
     forcing_time = t[:len(forcing)]
     threshold = havok.compute_threshold(forcing=0, p=0.2)
     pred_onsets = get_forcing_burst_indices(forcing, dt, threshold)
+
+    # Compare true and predicted inter-burst interval distributions
+    analyze_ibi_distribution(true_onsets, pred_onsets, t, dt)
+
+    x_recon = havok.reconstructed_data
+    analyze_extremes(x, x_recon, t, dt, threshold=1.5)
 
     # mHAVOK quality metrics
     r2_components = compute_component_r2(havok)
