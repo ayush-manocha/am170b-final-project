@@ -14,6 +14,7 @@ Quality metrics from:
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from pathlib import Path
 from scipy.integrate import solve_ivp
 from scipy.signal import find_peaks, lsim, StateSpace
 from scipy.stats import genextreme, ks_2samp, genpareto
@@ -49,6 +50,8 @@ def hindmarsh_rose(
 
 def generate_hr_data(
     t_eval,
+    rtol = 1e-10,
+    atol = 1e-12,
     **kwargs
 ):
     """Integrate the Hindmarsh-Rose system and return the state matrix."""
@@ -58,8 +61,8 @@ def generate_hr_data(
         y0 = [0.0, 0.0, 0.0],
         t_eval = t_eval,
         method = "RK45",
-        rtol = 1e-10,
-        atol = 1e-12,
+        rtol = rtol,
+        atol = atol,
     )
     if not sol.success:
         raise RuntimeError(f"ODE integration failed: {sol.message}")
@@ -485,7 +488,8 @@ def analyze_extremes(x_true, x_recon, t, dt, threshold=1.5):
     
     def return_period(exc_values, shape, scale, rate):
         surv = 1 - genpareto.cdf(exc_values, shape, loc=0, scale=scale)
-        return 1 / (surv * rate)
+        denom = np.maximum(surv * rate, 1e-12)
+        return 1 / denom
 
     rp_true  = return_period(exc_range, shape_true,  scale_true,  rate_true)
     rp_recon = return_period(exc_range, shape_recon, scale_recon, rate_recon)
@@ -581,11 +585,13 @@ def compute_recall_vs_window(
         recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
 
         # Baseline: random windows
-        rand_starts = np.random.randint(0, len(forcing) - window_samples, n_random)
-        baseline = np.mean([
-            np.any(np.abs(forcing[i:i + window_samples]) > threshold)
-            for i in rand_starts
-        ])
+        baseline = np.nan
+        if n_random > 0 and len(forcing) > window_samples:
+            rand_starts = np.random.randint(0, len(forcing) - window_samples, n_random)
+            baseline = np.mean([
+                np.any(np.abs(forcing[i:i + window_samples]) > threshold)
+                for i in rand_starts
+            ])
 
         results.append(dict(window = window, TP = TP, FN = FN, recall = recall, baseline = baseline))
 
@@ -657,11 +663,258 @@ def compute_lead_times(
     return np.array(lead_times)
 
 
+def hr_rhs(
+    state,
+    **kwargs,
+):
+    """State-only Hindmarsh-Rose right-hand side for tangent integration."""
+    return np.array(hindmarsh_rose(0.0, state, **kwargs), dtype=float)
+
+
+def hr_jacobian(
+    state,
+    a = 1.0,
+    b = 3.0,
+    d = 5.0,
+    r = 0.0021,
+    s = 4.0,
+    **_ignored,
+):
+    """Analytic Jacobian of the Hindmarsh-Rose vector field."""
+    x, _, _ = state
+    return np.array(
+        [
+            [-3 * a * x**2 + 2 * b * x, 1.0, -1.0],
+            [-2 * d * x, -1.0, 0.0],
+            [r * s, 0.0, -r],
+        ],
+        dtype=float,
+    )
+
+
+def rk4_state_tangent_step(
+    state,
+    tangent,
+    dt,
+    **kwargs,
+):
+    """Advance the state and tangent vector with a coupled RK4 step."""
+    k1_state = hr_rhs(state, **kwargs)
+    k1_tangent = hr_jacobian(state, **kwargs) @ tangent
+
+    state_2 = state + 0.5 * dt * k1_state
+    tangent_2 = tangent + 0.5 * dt * k1_tangent
+    k2_state = hr_rhs(state_2, **kwargs)
+    k2_tangent = hr_jacobian(state_2, **kwargs) @ tangent_2
+
+    state_3 = state + 0.5 * dt * k2_state
+    tangent_3 = tangent + 0.5 * dt * k2_tangent
+    k3_state = hr_rhs(state_3, **kwargs)
+    k3_tangent = hr_jacobian(state_3, **kwargs) @ tangent_3
+
+    state_4 = state + dt * k3_state
+    tangent_4 = tangent + dt * k3_tangent
+    k4_state = hr_rhs(state_4, **kwargs)
+    k4_tangent = hr_jacobian(state_4, **kwargs) @ tangent_4
+
+    next_state = state + (dt / 6.0) * (k1_state + 2 * k2_state + 2 * k3_state + k4_state)
+    next_tangent = tangent + (dt / 6.0) * (
+        k1_tangent + 2 * k2_tangent + 2 * k3_tangent + k4_tangent
+    )
+    return next_state, next_tangent
+
+
+def estimate_largest_lyapunov_exponent(
+    dt = 0.05,
+    total_time = 1200.0,
+    transient_time = 300.0,
+    renorm_interval = 1.0,
+    initial_state = None,
+    **kwargs,
+):
+    """Estimate the largest Lyapunov exponent by tangent renormalization."""
+    state = np.array([0.0, 0.0, 0.0] if initial_state is None else initial_state, dtype=float)
+    tangent = np.array([1.0, 0.0, 0.0], dtype=float)
+    tangent /= np.linalg.norm(tangent)
+
+    total_steps = int(total_time / dt)
+    transient_steps = int(transient_time / dt)
+    renorm_steps = max(1, int(round(renorm_interval / dt)))
+    log_sum = 0.0
+    count = 0
+
+    for step in range(total_steps):
+        state, tangent = rk4_state_tangent_step(state, tangent, dt, **kwargs)
+        if (step + 1) % renorm_steps != 0:
+            continue
+
+        tangent_norm = np.linalg.norm(tangent)
+        if tangent_norm == 0:
+            tangent = np.array([1.0, 0.0, 0.0], dtype=float)
+            tangent_norm = 1.0
+
+        if step + 1 > transient_steps:
+            log_sum += np.log(tangent_norm)
+            count += 1
+
+        tangent /= tangent_norm
+
+    elapsed = count * renorm_steps * dt
+    return log_sum / elapsed if elapsed > 0 else np.nan
+
+
+def extract_window_metric(
+    results,
+    key,
+    window,
+):
+    """Extract a single per-window metric from HAVOK summary output."""
+    for row in results:
+        if np.isclose(row["window"], window):
+            return float(row[key])
+    raise ValueError(f"Window {window} not present in metric table.")
+
+
+def summarize_component_r2(
+    r2_components,
+    num_chaos = 1,
+):
+    """Split R² values into linear and forcing summaries."""
+    linear_components = r2_components[:-num_chaos] if len(r2_components) > num_chaos else r2_components
+    forcing_components = r2_components[-num_chaos:]
+    return {
+        "mean_linear_r2": float(np.mean(linear_components)) if len(linear_components) > 0 else np.nan,
+        "forcing_r2": float(np.mean(forcing_components)) if len(forcing_components) > 0 else np.nan,
+    }
+
+
+def evaluate_havok_configuration(
+    signal,
+    t,
+    true_onsets,
+    svd_rank,
+    delays,
+    num_chaos = 1,
+    windows = None,
+    threshold_p = 0.2,
+    evaluation_window = 20.0,
+    include_diagnostics = False,
+    n_random_baseline = 0,
+):
+    """Fit HAVOK and return compact prediction-quality summaries."""
+    if windows is None:
+        windows = [50.0, 30.0, 20.0, 10.0, 5.0]
+
+    dt = t[1] - t[0]
+    havok = HAVOK(svd_rank = svd_rank, delays = delays, num_chaos = num_chaos)
+    havok.fit(signal, t)
+
+    forcing = havok.forcing[:, 0] if havok.forcing.ndim > 1 else havok.forcing
+    threshold = havok.compute_threshold(forcing = 0, p = threshold_p)
+    pred_onsets = get_forcing_burst_indices(forcing, dt, threshold)
+    recall_results = compute_recall_vs_window(
+        true_onsets,
+        forcing,
+        dt,
+        threshold,
+        windows,
+        n_random = n_random_baseline,
+    )
+    precision_results = compute_precision_vs_window(true_onsets, pred_onsets, t, dt, windows)
+    r2_components = compute_component_r2(havok)
+    r2_summary = summarize_component_r2(r2_components, num_chaos = num_chaos)
+
+    recall_at_window = extract_window_metric(recall_results, "recall", evaluation_window)
+    precision_at_window = extract_window_metric(precision_results, "precision", evaluation_window)
+    f1_at_window = 0.0
+    if recall_at_window + precision_at_window > 0:
+        f1_at_window = 2 * recall_at_window * precision_at_window / (recall_at_window + precision_at_window)
+
+    result = {
+        "rank": svd_rank,
+        "delays": delays,
+        "evaluation_window": evaluation_window,
+        "recall_at_window": recall_at_window,
+        "precision_at_window": precision_at_window,
+        "f1_at_window": float(f1_at_window),
+        "mean_linear_r2": r2_summary["mean_linear_r2"],
+        "forcing_r2": r2_summary["forcing_r2"],
+        "active_fraction": float(np.mean(np.abs(forcing) > threshold)),
+        "predicted_onsets": int(len(pred_onsets)),
+    }
+
+    if include_diagnostics:
+        result.update(
+            {
+                "recall_results": recall_results,
+                "precision_results": precision_results,
+                "r2_components": r2_components,
+                "singular_values": np.asarray(havok.singular_vals, dtype=float),
+                "operator": np.asarray(havok.operator, dtype=float),
+                "forcing": forcing,
+                "threshold": float(threshold),
+            }
+        )
+
+    return result
+
+
+def build_metric_grid(
+    records,
+    row_key,
+    row_values,
+    col_key,
+    col_values,
+    value_key,
+):
+    """Convert a list of records into a dense 2D grid."""
+    grid = np.full((len(row_values), len(col_values)), np.nan)
+    for row_index, row_value in enumerate(row_values):
+        for col_index, col_value in enumerate(col_values):
+            for row in records:
+                if row[row_key] == row_value and row[col_key] == col_value:
+                    grid[row_index, col_index] = row[value_key]
+                    break
+    return grid
+
+
+def plot_metric_heatmap(
+    ax,
+    matrix,
+    x_labels,
+    y_labels,
+    title,
+    cmap = "viridis",
+    vmin = None,
+    vmax = None,
+):
+    """Plot one annotated heatmap."""
+    image = ax.imshow(matrix, cmap = cmap, aspect = "auto", vmin = vmin, vmax = vmax)
+    ax.set_xticks(range(len(x_labels)))
+    ax.set_xticklabels(x_labels)
+    ax.set_yticks(range(len(y_labels)))
+    ax.set_yticklabels(y_labels)
+    ax.set_title(title)
+
+    finite_values = matrix[np.isfinite(matrix)]
+    threshold = np.nanmedian(finite_values) if finite_values.size > 0 else 0.0
+    for row_index in range(matrix.shape[0]):
+        for col_index in range(matrix.shape[1]):
+            value = matrix[row_index, col_index]
+            label = "nan" if np.isnan(value) else f"{value:.3f}"
+            color = "white" if np.isfinite(value) and value <= threshold else "black"
+            ax.text(col_index, row_index, label, ha = "center", va = "center", color = color, fontsize = 8)
+
+    return image
+
+
 def main():
     # Simulation
     dt = 0.1
     m = 500_000
     t = np.arange(m) * dt
+    plots_dir = Path("plots")
+    plots_dir.mkdir(parents = True, exist_ok = True)
 
     print("Simulating Hindmarsh-Rose system...")
     X = generate_hr_data(t)
@@ -669,6 +922,8 @@ def main():
     # Discard transient
     transient = int(950 / dt)
     x = X[0, transient:]
+    y = X[1, transient:]
+    z = X[2, transient:]
     t = t[transient:] - t[transient]
 
     # Ground-truth bursts
@@ -999,6 +1254,312 @@ def main():
     plt.suptitle("Embedded attractor — true vs HAVOK reconstruction", fontsize=13)
     plt.tight_layout()
     plt.savefig("plots/havok_hr_attractor.png", dpi=150)
+    plt.show()
+
+    # (8) Rank/delay sensitivity for recall, precision, and component R²
+    print("\n── Rank and delay sensitivity ─────────────────────────────────────")
+    sweep_points = min(len(x), 80_000)
+    sweep_t = t[:sweep_points]
+    sweep_x = x[:sweep_points]
+    sweep_y = y[:sweep_points]
+    sweep_z = z[:sweep_points]
+    sweep_true_onsets = get_burst_indices(sweep_x, dt)
+    sweep_windows = [50.0, 30.0, 20.0, 10.0, 5.0]
+    selected_window = 20.0
+    delay_grid = [50, 100, 150]
+    rank_grid = [5, 7, 9, 11, 13, 15]
+
+    x_sweep_records = []
+    for trial_delays in delay_grid:
+        for trial_rank in rank_grid:
+            if trial_rank >= trial_delays:
+                continue
+            x_sweep_records.append(
+                evaluate_havok_configuration(
+                    sweep_x,
+                    sweep_t,
+                    sweep_true_onsets,
+                    svd_rank = trial_rank,
+                    delays = trial_delays,
+                    windows = sweep_windows,
+                    evaluation_window = selected_window,
+                )
+            )
+
+    best_rank_delay = max(
+        x_sweep_records,
+        key = lambda row: (row["f1_at_window"], row["mean_linear_r2"], row["recall_at_window"]),
+    )
+    print(
+        f"  Best x-channel setting at {selected_window:.1f} tu: "
+        f"delays={best_rank_delay['delays']}, rank={best_rank_delay['rank']}, "
+        f"recall={best_rank_delay['recall_at_window']:.3f}, "
+        f"precision={best_rank_delay['precision_at_window']:.3f}, "
+        f"mean linear R²={best_rank_delay['mean_linear_r2']:.3f}"
+    )
+
+    recall_grid = build_metric_grid(x_sweep_records, "delays", delay_grid, "rank", rank_grid, "recall_at_window")
+    precision_grid = build_metric_grid(x_sweep_records, "delays", delay_grid, "rank", rank_grid, "precision_at_window")
+    linear_r2_grid = build_metric_grid(x_sweep_records, "delays", delay_grid, "rank", rank_grid, "mean_linear_r2")
+    forcing_r2_grid = build_metric_grid(x_sweep_records, "delays", delay_grid, "rank", rank_grid, "forcing_r2")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    images = []
+    images.append(plot_metric_heatmap(
+        axes[0, 0],
+        recall_grid,
+        rank_grid,
+        delay_grid,
+        f"Recall at {selected_window:.0f} tu",
+        vmin = 0,
+        vmax = 1,
+    ))
+    images.append(plot_metric_heatmap(
+        axes[0, 1],
+        precision_grid,
+        rank_grid,
+        delay_grid,
+        f"Precision at {selected_window:.0f} tu",
+        vmin = 0,
+        vmax = 1,
+    ))
+    images.append(plot_metric_heatmap(
+        axes[1, 0],
+        linear_r2_grid,
+        rank_grid,
+        delay_grid,
+        "Mean linear-component R²",
+        vmin = 0,
+        vmax = 1,
+    ))
+    images.append(plot_metric_heatmap(
+        axes[1, 1],
+        forcing_r2_grid,
+        rank_grid,
+        delay_grid,
+        "Forcing-component R²",
+    ))
+    for ax, image in zip(axes.flat, images):
+        fig.colorbar(image, ax = ax, fraction = 0.046, pad = 0.04)
+        ax.set_xlabel("rank")
+        ax.set_ylabel("delays")
+    plt.suptitle("HAVOK sensitivity to rank and delay", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(plots_dir / "havok_hr_rank_delay_sensitivity.png", dpi = 150)
+    plt.show()
+
+    # (9) Singular value spectrum by input channel
+    print("\n── Channel-wise singular value spectra ───────────────────────────")
+    singular_spectra = {}
+    for channel_name, signal in {"x": sweep_x, "y": sweep_y, "z": sweep_z}.items():
+        spectrum_result = evaluate_havok_configuration(
+            signal,
+            sweep_t,
+            sweep_true_onsets,
+            svd_rank = 15,
+            delays = 100,
+            windows = sweep_windows,
+            evaluation_window = selected_window,
+            include_diagnostics = True,
+        )
+        singular_values = spectrum_result["singular_values"]
+        singular_spectra[channel_name] = singular_values / singular_values[0]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    max_modes = min(25, min(len(values) for values in singular_spectra.values()))
+    modes = np.arange(1, max_modes + 1)
+    for channel_name, values in singular_spectra.items():
+        axes[0].semilogy(modes, values[:max_modes], marker="o", linewidth=1.5, label=channel_name)
+    axes[0].set_xlabel("mode index")
+    axes[0].set_ylabel("normalized singular value")
+    axes[0].set_title("Singular value spectrum by input channel")
+    axes[0].legend()
+
+    cumulative_energy = np.cumsum(havok.singular_vals**2) / np.sum(havok.singular_vals**2)
+    axes[1].plot(np.arange(1, len(cumulative_energy) + 1), cumulative_energy, marker="o", linewidth=1.5)
+    axes[1].axhline(0.99, color="tab:red", linestyle="--", linewidth=1.2, label="99% energy")
+    axes[1].set_xlabel("mode index")
+    axes[1].set_ylabel("cumulative energy")
+    axes[1].set_ylim(0, 1.02)
+    axes[1].set_title("Cumulative singular-value energy (x channel)")
+    axes[1].legend()
+    plt.tight_layout()
+    plt.savefig(plots_dir / "havok_hr_singular_spectrum.png", dpi = 150)
+    plt.show()
+
+    # (10) HAVOK operator matrix heatmap
+    fig, ax = plt.subplots(figsize=(6.5, 5.2))
+    image = ax.imshow(havok.operator, cmap="coolwarm", aspect="auto")
+    ax.set_xlabel("state index")
+    ax.set_ylabel("state derivative index")
+    ax.set_title("HAVOK operator heatmap (x channel baseline)")
+    fig.colorbar(image, ax=ax, label="operator coefficient")
+    plt.tight_layout()
+    plt.savefig(plots_dir / "havok_hr_operator_heatmap.png", dpi = 150)
+    plt.show()
+
+    # (11) Input-channel comparison across x, y, and z
+    print("\n── Input channel comparison ──────────────────────────────────────")
+    channel_best_results = []
+    for channel_name, signal in {"x": sweep_x, "y": sweep_y, "z": sweep_z}.items():
+        channel_records = []
+        for trial_delays in delay_grid:
+            for trial_rank in rank_grid:
+                if trial_rank >= trial_delays:
+                    continue
+                result = evaluate_havok_configuration(
+                    signal,
+                    sweep_t,
+                    sweep_true_onsets,
+                    svd_rank = trial_rank,
+                    delays = trial_delays,
+                    windows = sweep_windows,
+                    evaluation_window = selected_window,
+                )
+                result["channel"] = channel_name
+                channel_records.append(result)
+        best_channel_result = max(
+            channel_records,
+            key = lambda row: (row["f1_at_window"], row["mean_linear_r2"], row["recall_at_window"]),
+        )
+        channel_best_results.append(best_channel_result)
+        print(
+            f"  Best {channel_name}: delays={best_channel_result['delays']}, rank={best_channel_result['rank']}, "
+            f"recall={best_channel_result['recall_at_window']:.3f}, "
+            f"precision={best_channel_result['precision_at_window']:.3f}, "
+            f"F1={best_channel_result['f1_at_window']:.3f}, "
+            f"mean linear R²={best_channel_result['mean_linear_r2']:.3f}"
+        )
+
+    channel_labels = [row["channel"] for row in channel_best_results]
+    x_positions = np.arange(len(channel_best_results))
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+    metric_specs = [
+        ("recall_at_window", f"Recall at {selected_window:.0f} tu"),
+        ("precision_at_window", f"Precision at {selected_window:.0f} tu"),
+        ("f1_at_window", f"F1 at {selected_window:.0f} tu"),
+        ("mean_linear_r2", "Mean linear-component R²"),
+    ]
+    for ax, (metric_key, title) in zip(axes.flat, metric_specs):
+        values = [row[metric_key] for row in channel_best_results]
+        ax.bar(x_positions, values, color=["tab:blue", "tab:orange", "tab:green"])
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(channel_labels)
+        upper = max(values)
+        ax.set_ylim(0, max(1.0, 1.05 * upper))
+        ax.set_title(title)
+        for index, row in enumerate(channel_best_results):
+            ax.text(index, values[index] + 0.02, f"d={row['delays']}\nr={row['rank']}", ha="center", va="bottom", fontsize=8)
+    plt.suptitle("Best HAVOK performance by input channel", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(plots_dir / "havok_hr_channel_comparison.png", dpi = 150)
+    plt.show()
+
+    # (12) Sensitivity to I_ext and r, including Lyapunov exponents and HAVOK performance
+    print("\n── Parameter sensitivity in I_ext and r ──────────────────────────")
+    I_ext_grid = [3.05, 3.18, 3.281, 3.40]
+    r_grid = [0.0015, 0.0021, 0.0035]
+    parameter_records = []
+    param_m = 60_000
+    param_t_full = np.arange(param_m) * dt
+    param_transient = int(500 / dt)
+
+    for r_value in r_grid:
+        for I_value in I_ext_grid:
+            X_param = generate_hr_data(
+                param_t_full,
+                r = r_value,
+                I_ext = I_value,
+                rtol = 1e-7,
+                atol = 1e-9,
+            )
+            x_param = X_param[0, param_transient:]
+            t_param = param_t_full[param_transient:] - param_t_full[param_transient]
+            onsets_param = get_burst_indices(x_param, dt)
+            lyapunov = estimate_largest_lyapunov_exponent(I_ext = I_value, r = r_value)
+
+            if len(onsets_param) < 3:
+                parameter_records.append(
+                    {
+                        "I_ext": I_value,
+                        "r": r_value,
+                        "lyapunov": lyapunov,
+                        "recall_at_window": np.nan,
+                        "precision_at_window": np.nan,
+                        "mean_linear_r2": np.nan,
+                    }
+                )
+                continue
+
+            param_result = evaluate_havok_configuration(
+                x_param,
+                t_param,
+                onsets_param,
+                svd_rank = 15,
+                delays = 100,
+                windows = sweep_windows,
+                evaluation_window = selected_window,
+            )
+            parameter_records.append(
+                {
+                    "I_ext": I_value,
+                    "r": r_value,
+                    "lyapunov": lyapunov,
+                    "recall_at_window": param_result["recall_at_window"],
+                    "precision_at_window": param_result["precision_at_window"],
+                    "mean_linear_r2": param_result["mean_linear_r2"],
+                }
+            )
+
+    lyapunov_grid = build_metric_grid(parameter_records, "r", r_grid, "I_ext", I_ext_grid, "lyapunov")
+    param_recall_grid = build_metric_grid(parameter_records, "r", r_grid, "I_ext", I_ext_grid, "recall_at_window")
+    param_precision_grid = build_metric_grid(parameter_records, "r", r_grid, "I_ext", I_ext_grid, "precision_at_window")
+    param_linear_r2_grid = build_metric_grid(parameter_records, "r", r_grid, "I_ext", I_ext_grid, "mean_linear_r2")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    parameter_images = []
+    parameter_images.append(plot_metric_heatmap(
+        axes[0, 0],
+        lyapunov_grid,
+        I_ext_grid,
+        r_grid,
+        "Largest Lyapunov exponent",
+        cmap = "magma",
+    ))
+    parameter_images.append(plot_metric_heatmap(
+        axes[0, 1],
+        param_recall_grid,
+        I_ext_grid,
+        r_grid,
+        f"Recall at {selected_window:.0f} tu",
+        vmin = 0,
+        vmax = 1,
+    ))
+    parameter_images.append(plot_metric_heatmap(
+        axes[1, 0],
+        param_precision_grid,
+        I_ext_grid,
+        r_grid,
+        f"Precision at {selected_window:.0f} tu",
+        vmin = 0,
+        vmax = 1,
+    ))
+    parameter_images.append(plot_metric_heatmap(
+        axes[1, 1],
+        param_linear_r2_grid,
+        I_ext_grid,
+        r_grid,
+        "Mean linear-component R²",
+        vmin = 0,
+        vmax = 1,
+    ))
+    for ax, image in zip(axes.flat, parameter_images):
+        fig.colorbar(image, ax = ax, fraction = 0.046, pad = 0.04)
+        ax.set_xlabel("I_ext")
+        ax.set_ylabel("r")
+    plt.suptitle("Chaos and HAVOK sensitivity across I_ext and r", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(plots_dir / "havok_hr_parameter_sensitivity.png", dpi = 150)
     plt.show()
 
 
