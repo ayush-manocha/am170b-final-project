@@ -1,0 +1,4 @@
+observable set,delays,rank,median |gap| (s),median signed gap (s),fraction within 0.10 s,fraction preceding
+z only,150,9,0.007,0.0,0.6071,0.6071
+x and z,150,13,0.0275,0.0,0.6071,0.6429
+x only,150,5,0.0625,-0.018,0.6786,0.6786
