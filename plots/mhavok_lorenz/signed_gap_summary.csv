@@ -1,4 +1,4 @@
-observable set,median signed gap (s),25th percentile (s),75th percentile (s),min gap (s),max gap (s),fraction preceding
-x only,-0.018,-0.0505,0.4935,-0.277,0.645,0.6786
-z only,0.0,-0.0005,0.542,-1.519,2.095,0.6071
-x and z,0.0,-0.0107,0.5078,-1.541,2.087,0.6429
+observable set,median signed gap (s),fraction preceding
+x only,-0.018,0.6786
+z only,0.0,0.6071
+x and z,0.0,0.6429
