@@ -1,0 +1,2 @@
+dt,analysis_points,analysis_duration,burst_onsets,warning_window,forcing_quantile,min_event_gap
+0.1,30000,2999.9,19,20.0,0.8,30.0

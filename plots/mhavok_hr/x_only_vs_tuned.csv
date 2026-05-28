@@ -1,0 +1,4 @@
+model,observable set,delays,rank,event recall,event precision,event F1,mean linear R²,mean lead time (tu),median |gap| (tu)
+best x only,x,50,5,0.2105,0.1481,0.1739,0.873,0.05,0.1
+best x+y+z alignment,x+y+z,50,9,0.7895,0.5556,0.6522,0.9338,0.1533,0.2
+best x+y+z warning,x+y+z,50,9,0.7895,0.5556,0.6522,0.9338,0.1533,0.2

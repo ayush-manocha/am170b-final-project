@@ -1,0 +1,17 @@
+Hindmarsh-Rose mHAVOK full-run summary
+
+Source run:
+- command: python mhavok_hr.py --analysis-points 80000
+- post-transient samples: 80000
+- detected burst onsets: 39
+- warning window: 20.0 time units
+- forcing quantile: 0.80
+- merged-event gap: 30.0 time units
+
+Key full-run results from the completed 80k-sample sweep:
+- Best x-only configuration: delays=50, rank=13, recall=0.0000, precision=0.0000, F1=0.0000
+- Best x+y+z alignment configuration: delays=50, rank=9, median |gap|=0.1000, recall=0.7179, precision=0.4000
+- Best x+y+z warning configuration: delays=50, rank=9, recall=0.7179, precision=0.4000, F1=0.5140, mean lead=0.1710
+- Best overall observable combination by warning F1: z only, delays=50, rank=5, recall=1.0000, precision=0.5735, F1=0.7290, mean linear R^2=0.9559, mean lead=0.1308, median |gap|=0.0000
+
+Packaged artifacts in this folder are copied from plots/mhavok_hr after the full export refresh completes.

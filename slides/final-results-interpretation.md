@@ -7,6 +7,7 @@
 - The strongest defensible claim is that the HAVOK forcing signal is a useful early-warning marker for burst onset in the tested HR regime.
 - The data support this because recall is 1.000 across 50, 30, 20, and 10 time-unit windows, with precision 0.699 over those same windows and a mean lead time of 8.0 time units.
 - The stronger claim that HAVOK gives a faithful free-running surrogate for HR burst statistics is not supported by the current results.
+- The new HR mHAVOK sweep adds a second claim: observable choice matters materially for burst warning, and the best warning model on the tested 80k-sample grid is not the full-state `x+y+z` configuration.
 
 ### Lorenz
 
@@ -25,6 +26,25 @@
 - The forcing mode is the weakest-fit mode in the latent model, with R² = 0.5128.
 - The free-running reconstruction is poor, with R²_rec = -1935.3039 on train and -518.8316 on test.
 - The burst-interval and extreme-value summaries are mismatched: predicted IBI mean is 159.0 versus true mean 227.8, the KS test rejects equality of the IBI distributions, and reconstructed threshold exceedances are much too frequent.
+
+## What To Say About The New HR mHAVOK Sweep
+
+### Short version for the poster or talk
+
+- “Adding channels changes the HR warning result, but not in the naive way. On the tested grid, the slow `z` variable gives the strongest warning performance, and full-state `x+y+z` is good but not the best.”
+
+### Concrete numbers to cite
+
+- Full HR mHAVOK sweep size: 80,000 post-transient samples with 39 burst onsets.
+- Best overall warning model on the tested grid: `z` only with delays = 50, rank = 5, recall = 1.000, precision = 0.5735, F1 = 0.7290, mean lead time = 0.1308 time units.
+- Best full-state `x+y+z` model on the tested grid: delays = 50, rank = 9, recall = 0.7179, precision = 0.4000, F1 = 0.5140, mean lead time = 0.1710 time units.
+- Best x-only model on the tested grid is much weaker, which reinforces the point that observable selection is a first-order modeling choice here.
+
+### How to frame that result safely
+
+- Do not oversell this as “mHAVOK beats HAVOK everywhere.” The single-channel HAVOK result is still the strongest direct early-warning story in the current repo.
+- Do use the HR mHAVOK sweep as evidence that the multichannel framework is scientifically interesting on HR because it reveals which observables carry warning information.
+- The defensible interpretation is that `z` and `x+z` seem to carry the cleanest burst-cycle information on the tested grid, while adding every channel does not automatically help.
 
 ### How to explain the apparent contradiction
 

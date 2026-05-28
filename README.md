@@ -2,6 +2,9 @@
 
 Initial code running the H-R model can be found in `hr-havok.py`.
 
+The standalone manual mHAVOK implementation for the Hindmarsh-Rose system can
+be found in `mhavok_hr.py`.
+
 The standalone manual mHAVOK implementation for Lorenz can be found in
 `mhavok_lorenz.py`.
 
@@ -18,7 +21,11 @@ python3 -m venv venv
 source venv/bin/activate
 pip install . # Install dependencies
 python3 hr-havok.py
+python3 mhavok_hr.py
 python3 mhavok_lorenz.py
+
+# Faster smoke test for the standalone HR mHAVOK script
+python3 mhavok_hr.py --quick
 
 # Faster smoke test for the standalone Lorenz mHAVOK script
 python3 mhavok_lorenz.py --quick
