@@ -225,7 +225,7 @@ def simulate_havok(
     havok_train,
     V_linear,
     V_forcing,
-    t_vec
+    t_vec,
 ):
     """
     Simulate the HAVOK linear system using training matrices A and B.
@@ -275,37 +275,6 @@ def compute_r2_rec(
         ss_tot = np.sum((v_og - v_rec.mean()) ** 2)
         r2_per_dim.append(1 - ss_res / ss_tot if ss_tot > 0 else 0.0)
     return float(np.mean(r2_per_dim))
-
-
-def compute_r2_rec_vs_length(
-    V_true,
-    V_sim,
-    t_vec,
-    n_points = 20
-):
-    """
-    Compute R^2_rec as a function of simulation length to show
-    how reconstruction quality changes over time.
-
-    Args:
-        V_true (np.ndarray): True embeddings.
-        V_sim (np.ndarray): Simulated embeddings.
-        t_vec (np.ndarray): Time vector.
-        n_points (int): Number of length values to evaluate.
-
-    Returns:
-        tuple: (times, r2_values)
-    """
-    n_max  = min(len(V_true), len(V_sim))
-    fracs  = np.linspace(0.05, 1.0, n_points)
-    times  = []
-    r2s    = []
-    for frac in fracs:
-        n = max(int(frac * n_max), 10)
-        r2 = compute_r2_rec(V_true[:n], V_sim[:n])
-        times.append(t_vec[n - 1] - t_vec[0])
-        r2s.append(r2)
-    return np.array(times), np.array(r2s)
 
 
 def compute_rolling_rmse(
@@ -725,25 +694,24 @@ def main():
         havok_train, V_linear_train, V_forcing_train, t_train
     )
     r2_rec_train = compute_r2_rec(V_linear_train, V_sim_train)
-    sim_times_train, r2_vs_length_train = compute_r2_rec_vs_length(
-        V_linear_train, V_sim_train, t_train
-    )
-    rmse_times_train, rmse_values_train = compute_rolling_rmse(
-        V_linear_train, V_sim_train, t_train, window_tu=50.0, dt=dt
-    )
- 
+
     # Project and simulate on test data
     V_linear_test, V_forcing_test = project_to_embedding(havok_train, x_test)
+
     V_sim_test = simulate_havok(
-        havok_train, V_linear_test, V_forcing_test, t_test
+        havok_train, V_linear_test, V_forcing_test, t_test,
     )
     r2_rec_test = compute_r2_rec(V_linear_test, V_sim_test)
-    sim_times_test, r2_vs_length_test = compute_r2_rec_vs_length(
-        V_linear_test, V_sim_test, t_test
+
+    rmse_times_train, rmse_values_train = compute_rolling_rmse(
+        V_linear_train, V_sim_train, t_train, window_tu=50.0, dt=dt
     )
     rmse_times_test, rmse_values_test = compute_rolling_rmse(
         V_linear_test, V_sim_test, t_test, window_tu=50.0, dt=dt
     )
+
+    print(f"V_linear_train range: {V_linear_train.min():.4f} to {V_linear_train.max():.4f}")
+    print(f"V_linear_train std:   {V_linear_train.std():.4f}")
  
     print(f"  R²_rec on train set: {r2_rec_train:.4f}")
     print(f"  R²_rec on test set:  {r2_rec_test:.4f}")
@@ -804,6 +772,18 @@ def main():
 
     in_range      = true_onsets[true_onsets < n_plot]
     pred_in_range = pred_onsets[pred_onsets < n_plot]
+
+    # Bursting plot
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(t_plot, x_plot, c="k", lw=0.6)
+    ax.vlines(t[in_range], x_plot.min(), x_plot.max(),
+              color="tab:blue", lw=1.2, alpha=0.7, label="True burst onset")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Membrane potential (x)")
+    ax.set_title("Chaotic bursting in the Hindmarsh-Rose neuron")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("plots/bursting.png", dpi=150)
 
     # (1) Main detection plot
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
@@ -952,21 +932,8 @@ def main():
     plt.savefig("plots/havok_hr_reconstruction.png", dpi=150)
     plt.show()
  
-    # (6) R²_rec vs simulation length — train and test
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
- 
-    ax = axes[0]
-    ax.plot(sim_times_train, r2_vs_length_train, "o-", c="gray",
-            lw=2, alpha=0.8, label=f"Train  (R²_rec = {r2_rec_train:.1f})")
-    ax.plot(sim_times_test,  r2_vs_length_test,  "o-", c="tab:blue",
-            lw=2, label=f"Test   (R²_rec = {r2_rec_test:.1f})")
-    ax.axhline(0, c="k", ls="--", lw=1, label="Baseline (predict mean)")
-    ax.set_xlabel("Simulation length (time units)")
-    ax.set_ylabel("R²_rec")
-    ax.set_title("Reconstruction quality vs simulation length")
-    ax.legend(fontsize=8)
- 
-    ax = axes[1]
+    # (6) RMSE vs simulation length — train and test
+    fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(rmse_times_train, rmse_values_train,
             c="gray", lw=1.5, alpha=0.8, label="Train")
     ax.plot(rmse_times_test,  rmse_values_test,
@@ -974,9 +941,8 @@ def main():
     ax.set_xlabel("Time (time units)")
     ax.set_ylabel("RMSE (embedding space)")
     ax.set_title("Rolling RMSE of embedding reconstruction")
-    ax.legend(fontsize=8)
- 
-    plt.suptitle("HAVOK reconstruction quality — train vs test", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.spines[["top", "right"]].set_visible(False)
     plt.tight_layout()
     plt.savefig("plots/havok_hr_reconstruction_quality.png", dpi=150)
     plt.show()
@@ -1003,4 +969,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+   main()
