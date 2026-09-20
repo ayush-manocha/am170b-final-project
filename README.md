@@ -19,3 +19,6 @@ Contributions:
   - Researched Hindmarsh-Rose model
   - Implemented HAVOK on H-R
   - Burst prediction and reconstruction quality results (in `hr_havok.py`)
+- Hafsah:
+  - Implemented Lyapunov exponent analysis to demonstrate chaotic behavior in the Hindmarsh–Rose model.
+  - Built 40+ parameter sweep experiments to evaluate HAVOK across different dynamical regimes.
